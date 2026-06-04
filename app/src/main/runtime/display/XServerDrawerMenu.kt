@@ -599,6 +599,7 @@ fun buildXServerDrawerState(
     inputControlsGcmRumbleMode: String = "disabled",
     fullscreenEnabled: Boolean = false,
     maxRefreshRate: Int = 60,
+    refactorSizeEnabled: Boolean = false,
 ): XServerDrawerState {
     val items =
         mutableListOf(
@@ -686,6 +687,15 @@ fun buildXServerDrawerState(
                 active = magnifierActive,
             )
     }
+
+    items +=
+        XServerDrawerItem(
+            itemId = R.id.main_menu_refactor_size,
+            title = context.getString(R.string.session_drawer_refactor_size),
+            subtitle = "",
+            icon = Icons.Outlined.PictureInPictureAlt,
+            active = refactorSizeEnabled,
+        )
 
     items +=
         XServerDrawerItem(
