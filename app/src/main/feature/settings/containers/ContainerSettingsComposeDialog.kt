@@ -400,6 +400,7 @@ class ContainerSettingsComposeDialog @JvmOverloads constructor(
         }
 
         state.fullscreenStretched.value = c?.isFullscreenStretched() ?: false
+        state.directComposition.value = c?.isDirectCompositionEnabled() ?: false
 
         // Steam fields are shortcut-only in the UI; leave any existing steam
         // state on the container untouched — saveSettings() skips them.
@@ -777,6 +778,7 @@ class ContainerSettingsComposeDialog @JvmOverloads constructor(
             c.setWinComponents(wincomponents)
             c.setDrives(drivesString)
             c.setFullscreenStretched(state.fullscreenStretched.value)
+            c.setDirectCompositionEnabled(state.directComposition.value)
             c.setInputType(finalInputType)
             c.setExclusiveXInput(state.containerExclusiveInput.value)
             c.setStartupSelection(startupSelection)
@@ -817,6 +819,7 @@ class ContainerSettingsComposeDialog @JvmOverloads constructor(
                 data.put("wincomponents", wincomponents)
                 data.put("drives", drivesString)
                 data.put("fullscreenStretched", state.fullscreenStretched.value)
+                data.put(Container.EXTRA_DIRECT_COMPOSITION, if (state.directComposition.value) "1" else "0")
                 data.put("inputType", finalInputType)
                 data.put("exclusiveXInput", state.containerExclusiveInput.value)
                 data.put("startupSelection", startupSelection.toInt())

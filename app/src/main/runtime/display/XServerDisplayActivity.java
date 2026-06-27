@@ -26,6 +26,8 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.PointerIcon;
+import android.view.Surface;
+import android.view.SurfaceHolder;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
@@ -248,6 +250,14 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             "cmd"
     ));
     private XServerSurfaceView xServerView;
+
+    // === DIRECT COMPOSITION ===
+    // Per-activity DirectCompositionLayer wrapping a child ASurfaceControl.
+    // Non-null only when the container has Direct Composition enabled AND the
+    // device supports it (API 29+ + not blocklisted). Attached when the
+    // SurfaceView's surface is created, released on surface destroyed / activity destroy.
+    private com.winlator.cmod.runtime.display.composition.DirectCompositionLayer directCompositionLayer;
+    private boolean directCompositionInstalled = false;
     private InputControlsView inputControlsView;
     private boolean inputControlsRevealAllowed = false;
     private TouchpadView touchpadView;
@@ -3678,6 +3688,12 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     @Override
     protected void onDestroy() {
         activityDestroyed.set(true);
+        // Release the Direct Composition layer BEFORE the rest of teardown —
+        // the native side waits for in-flight ASurfaceTransactions to complete
+        // before ASurfaceControl_release, which prevents the Xiaomi/HyperOS
+        // SurfaceFlinger crash that occurs if the SC is released while a
+        // transaction is still in-flight.
+        releaseDirectCompositionLayer();
         if (isDependencyInstall) {
             com.winlator.cmod.runtime.content.component.DependencyInstallBridge.complete(dependencyExitStatus);
         }
@@ -6472,6 +6488,13 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         xServer.setRenderer(renderer);
         rootView.addView(xServerView);
 
+        // === DIRECT COMPOSITION lifecycle install ===
+        // If the container has Direct Composition enabled AND the device
+        // supports ASurfaceControl (API 29+ + not blocklisted), install the
+        // SurfaceHolder callback that attaches/releases the
+        // DirectCompositionLayer around the SurfaceView's surface lifecycle.
+        installDirectCompositionLifecycle();
+
         globalCursorSpeed = preferences.getFloat("cursor_speed", 1.0f);
         touchpadView = new TouchpadView(this, xServer, timeoutHandler, hideControlsRunnable);
         touchpadView.setTapToClickEnabled(isTapToClickEnabled);
@@ -6562,6 +6585,114 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             }
         }
         return shortcutName;
+    }
+
+    // === DIRECT COMPOSITION LIFECYCLE ===
+    //
+    // Installs a SurfaceHolder.Callback on xServerView's holder that:
+    //   - On surfaceCreated: creates the DirectCompositionLayer, attaches it
+    //     to the Surface, and hands it to the VulkanRenderer as its
+    //     directCompositionTarget.
+    //   - On surfaceDestroyed: detaches the target from the renderer, releases
+    //     the layer.
+    // The layer is only created if:
+    //   1. The container has Direct Composition enabled.
+    //   2. SurfaceCompositor.isAvailable() (API 29+ + symbols present + not
+    //      blocklisted).
+    // Otherwise this is a no-op — VulkanRenderer composites normally.
+    private void installDirectCompositionLifecycle() {
+        if (directCompositionInstalled) return;
+        if (xServerView == null) return;
+
+        boolean enabled = container != null && container.isDirectCompositionEnabled();
+        if (!enabled) {
+            Log.i("XServerDisplayActivity", "Direct Composition disabled for this container");
+            return;
+        }
+        if (!com.winlator.cmod.runtime.display.composition.SurfaceCompositor.isAvailable()) {
+            Log.w("XServerDisplayActivity",
+                    "Direct Composition enabled but not available on this device "
+                            + "(API < 29, missing symbols, or blocklisted). "
+                            + "Falling back to VulkanRenderer composition.");
+            return;
+        }
+
+        directCompositionInstalled = true;
+        Log.i("XServerDisplayActivity", "Installing Direct Composition lifecycle");
+
+        xServerView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                // GLSurfaceView's render thread can fire surfaceCreated before
+                // setupUI returns, so the initial surfaceCreated may have
+                // already happened by the time we install this callback. The
+                // XServerSurfaceView handles the initial attach internally;
+                // we just need to attach our SC layer here.
+                if (directCompositionLayer != null) return;
+                android.view.Surface surface = holder.getSurface();
+                if (surface == null || !surface.isValid()) return;
+
+                directCompositionLayer = new com.winlator.cmod.runtime.display.composition.DirectCompositionLayer();
+                if (!directCompositionLayer.attach(surface)) {
+                    Log.e("XServerDisplayActivity",
+                            "DirectCompositionLayer.attach failed — disabling DC for this session");
+                    directCompositionLayer.release();
+                    directCompositionLayer = null;
+                    return;
+                }
+                VulkanRenderer r = xServerView != null ? xServerView.getRenderer() : null;
+                if (r != null) {
+                    r.setDirectCompositionTarget(directCompositionLayer);
+                }
+                Log.i("XServerDisplayActivity", "Direct Composition layer attached");
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+                // No-op — the SC layer's geometry is set per-frame in
+                // VulkanRenderer.maybePushDirectComposition via setPosition/setScale.
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                releaseDirectCompositionLayer();
+            }
+        });
+
+        // If the surface was already created before we installed the callback
+        // (race with GLSurfaceView's GLThread), synthesize the initial attach.
+        if (xServerView.getHolder().getSurface() != null
+                && xServerView.getHolder().getSurface().isValid()) {
+            android.view.Surface surface = xServerView.getHolder().getSurface();
+            directCompositionLayer = new com.winlator.cmod.runtime.display.composition.DirectCompositionLayer();
+            if (directCompositionLayer.attach(surface)) {
+                VulkanRenderer r = xServerView.getRenderer();
+                if (r != null) r.setDirectCompositionTarget(directCompositionLayer);
+                Log.i("XServerDisplayActivity",
+                        "Direct Composition layer attached (synthesized initial)");
+            } else {
+                directCompositionLayer.release();
+                directCompositionLayer = null;
+            }
+        }
+    }
+
+    /**
+     * Detach the DirectCompositionLayer from the renderer and release it.
+     * Safe to call from the UI thread; DirectCompositionLayer's synchronized
+     * methods serialize against any in-flight pushBuffer on the render thread.
+     * The native side waits for in-flight ASurfaceTransactions to complete
+     * before ASurfaceControl_release (prevents the Xiaomi/HyperOS SF crash).
+     */
+    private void releaseDirectCompositionLayer() {
+        if (directCompositionLayer == null) return;
+        VulkanRenderer r = xServerView != null ? xServerView.getRenderer() : null;
+        if (r != null) {
+            r.setDirectCompositionTarget(null);
+        }
+        directCompositionLayer.release();
+        directCompositionLayer = null;
+        Log.i("XServerDisplayActivity", "Direct Composition layer released");
     }
 
     private void setTextColorForDialog(ViewGroup viewGroup, int color) {
