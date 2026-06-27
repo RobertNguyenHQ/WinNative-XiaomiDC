@@ -639,20 +639,34 @@ public class VulkanRenderer
                 dcLastPushedW = surfaceWidth;
                 dcLastPushedH = surfaceHeight;
                 dcConsecutiveFailures = 0;
-                dcLayerActive = true;
+                if (!dcLayerActive) {
+                    dcLayerActive = true;
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC ACTIVE — first frame pushed to SurfaceControl (ahb=0x"
+                                    + Long.toHexString(ahbPtr) + " " + surfaceWidth + "x" + surfaceHeight + ")");
+                    notifyDirectCompositionStateListener();
+                }
                 return true;
             } else {
                 dcConsecutiveFailures++;
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DC pushBuffer FAILED (#" + dcConsecutiveFailures + ") — ahb=0x"
+                                + Long.toHexString(ahbPtr));
                 if (dcConsecutiveFailures >= DC_FAIL_LIMIT) {
                     Log.w(TAG, "DirectComposition push failed " + dcConsecutiveFailures
                             + " frames in a row — disabling target for this session");
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC DISABLED — " + DC_FAIL_LIMIT + " consecutive failures, self-detaching");
                     // Hide the SC layer BEFORE nulling the field — once the
                     // field is null, maybeHideDirectComposition has nothing to
                     // call hide() on, and SurfaceFlinger would keep showing
                     // the last successfully-pushed buffer over the
                     // VulkanRenderer output forever.
                     dcTarget.hide();
-                    dcLayerActive = false;
+                    if (dcLayerActive) {
+                        dcLayerActive = false;
+                        notifyDirectCompositionStateListener();
+                    }
                     directCompositionTarget = null;
                     dcLastPushedAhb = 0L;
                     dcLastPushedW = 0;
@@ -679,6 +693,7 @@ public class VulkanRenderer
             dcTarget.hide();
         }
         dcLayerActive = false;
+        notifyDirectCompositionStateListener();
         // Invalidate the cache so the next pushBuffer re-shows with a fresh
         // setBuffer + setVisibility(SHOW) transaction, even if the same AHB
         // pointer happens to be active.
@@ -701,6 +716,25 @@ public class VulkanRenderer
         dcLastPushedH = 0;
         dcConsecutiveFailures = 0;
         dcLayerActive = false;
+        // Notify the listener that DC state may have changed (target attached
+        // or detached). The activity uses this to update the HUD indicator.
+        notifyDirectCompositionStateListener();
+    }
+
+    // === DC STATE LISTENER (for HUD indicator) ===
+    // Called when the DC layer goes active/inactive. The activity registers a
+    // listener to update the FrameRating HUD (" + DC" suffix on the renderer
+    // label). Null by default; set by XServerDisplayActivity.
+    public interface DirectCompositionStateListener {
+        void onDirectCompositionStateChanged(boolean active);
+    }
+    private volatile DirectCompositionStateListener dcStateListener;
+    public void setDirectCompositionStateListener(DirectCompositionStateListener listener) {
+        this.dcStateListener = listener;
+    }
+    private void notifyDirectCompositionStateListener() {
+        DirectCompositionStateListener l = dcStateListener;
+        if (l != null) l.onDirectCompositionStateChanged(dcLayerActive);
     }
 
     // ----- WindowManager / Pointer listeners --------------------------------

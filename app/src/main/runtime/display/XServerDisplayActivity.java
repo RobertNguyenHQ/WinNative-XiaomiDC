@@ -3694,6 +3694,8 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         // SurfaceFlinger crash that occurs if the SC is released while a
         // transaction is still in-flight.
         releaseDirectCompositionLayer();
+        // Close the DC diagnostic file so it's flushed and ready to share.
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.closeDiagnosticFile();
         if (isDependencyInstall) {
             com.winlator.cmod.runtime.content.component.DependencyInstallBridge.complete(dependencyExitStatus);
         }
@@ -6495,6 +6497,19 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         // DirectCompositionLayer around the SurfaceView's surface lifecycle.
         installDirectCompositionLifecycle();
 
+        // === HUD INDICATOR for Direct Composition ===
+        // Register a listener on the VulkanRenderer so that when DC goes
+        // active/inactive, the FrameRating HUD updates its renderer label
+        // (appends " + DC" in green when active). The frameRating may not
+        // exist yet (created later if FPS monitor is enabled); the listener
+        // null-checks it on each callback.
+        renderer.setDirectCompositionStateListener(active -> {
+            final FrameRating fr = frameRating;
+            if (fr != null) {
+                runOnUiThread(() -> fr.setDirectCompositionActive(active));
+            }
+        });
+
         globalCursorSpeed = preferences.getFloat("cursor_speed", 1.0f);
         touchpadView = new TouchpadView(this, xServer, timeoutHandler, hideControlsRunnable);
         touchpadView.setTapToClickEnabled(isTapToClickEnabled);
@@ -6604,12 +6619,41 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         if (directCompositionInstalled) return;
         if (xServerView == null) return;
 
-        boolean enabled = container != null && container.isDirectCompositionEnabled();
+        // Init the diagnostic file so DC events are captured in the user's
+        // shared logs (the wine_*.txt logs only capture Wine stderr, not
+        // logcat). The file lives in the app's logs dir and is auto-included
+        // when the user shares logs.
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.initDiagnosticFile(
+                com.winlator.cmod.runtime.system.LogManager.getLogsDir(this));
+
+        // Read the toggle: shortcut overrides container (matches the swapRB
+        // pattern at line ~6470). If no shortcut, fall back to the container.
+        boolean enabled;
+        if (shortcut != null) {
+            enabled = shortcut.getExtra(
+                    com.winlator.cmod.runtime.container.Container.EXTRA_DIRECT_COMPOSITION,
+                    container != null && container.isDirectCompositionEnabled() ? "1" : "0")
+                    .equals("1");
+        } else {
+            enabled = container != null && container.isDirectCompositionEnabled();
+        }
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "installDirectCompositionLifecycle: enabled=" + enabled
+                        + " hasShortcut=" + (shortcut != null)
+                        + " hasContainer=" + (container != null));
         if (!enabled) {
-            Log.i("XServerDisplayActivity", "Direct Composition disabled for this container");
+            com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                    "Direct Composition DISABLED for this session (toggle off)");
+            Log.i("XServerDisplayActivity", "Direct Composition disabled for this session");
             return;
         }
-        if (!com.winlator.cmod.runtime.display.composition.SurfaceCompositor.isAvailable()) {
+        boolean available = com.winlator.cmod.runtime.display.composition.SurfaceCompositor.isAvailable();
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "SurfaceCompositor.isAvailable() = " + available);
+        if (!available) {
+            com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                    "Direct Composition NOT available — API < 29, missing symbols, or blocklisted. "
+                            + "Falling back to VulkanRenderer composition.");
             Log.w("XServerDisplayActivity",
                     "Direct Composition enabled but not available on this device "
                             + "(API < 29, missing symbols, or blocklisted). "
@@ -6618,6 +6662,8 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         }
 
         directCompositionInstalled = true;
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "Installing Direct Composition lifecycle — attaching SurfaceHolder callback");
         Log.i("XServerDisplayActivity", "Installing Direct Composition lifecycle");
 
         xServerView.getHolder().addCallback(new SurfaceHolder.Callback() {
@@ -6634,6 +6680,8 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
 
                 directCompositionLayer = new com.winlator.cmod.runtime.display.composition.DirectCompositionLayer();
                 if (!directCompositionLayer.attach(surface)) {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DirectCompositionLayer.attach FAILED — disabling DC for this session");
                     Log.e("XServerDisplayActivity",
                             "DirectCompositionLayer.attach failed — disabling DC for this session");
                     directCompositionLayer.release();
@@ -6644,6 +6692,8 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                 if (r != null) {
                     r.setDirectCompositionTarget(directCompositionLayer);
                 }
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DirectCompositionLayer ATTACHED — SC layer created, waiting for first frame");
                 Log.i("XServerDisplayActivity", "Direct Composition layer attached");
             }
 
@@ -6668,9 +6718,13 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             if (directCompositionLayer.attach(surface)) {
                 VulkanRenderer r = xServerView.getRenderer();
                 if (r != null) r.setDirectCompositionTarget(directCompositionLayer);
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DirectCompositionLayer ATTACHED (synthesized initial) — waiting for first frame");
                 Log.i("XServerDisplayActivity",
                         "Direct Composition layer attached (synthesized initial)");
             } else {
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DirectCompositionLayer.attach FAILED (synthesized) — disabling DC");
                 directCompositionLayer.release();
                 directCompositionLayer = null;
             }
@@ -6686,6 +6740,8 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
      */
     private void releaseDirectCompositionLayer() {
         if (directCompositionLayer == null) return;
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "releaseDirectCompositionLayer: detaching + releasing SC layer");
         VulkanRenderer r = xServerView != null ? xServerView.getRenderer() : null;
         if (r != null) {
             r.setDirectCompositionTarget(null);

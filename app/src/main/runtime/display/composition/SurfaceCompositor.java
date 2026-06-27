@@ -1,7 +1,15 @@
 package com.winlator.cmod.runtime.display.composition;
 
+import android.content.Context;
 import android.os.Build;
 import android.util.Log;
+
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
 
 /**
  * Bridge to the native {@code surface_compositor.c} module — gives the rest of
@@ -153,4 +161,86 @@ public final class SurfaceCompositor {
     }
 
     private static native boolean nativeIsAvailable();
+
+    // === DIAGNOSTIC FILE LOGGING ===
+    //
+    // The wine_*.txt logs the user shares only capture Wine/FEX stderr — they
+    // do NOT contain Android logcat. To make Direct Composition status visible
+    // in the user's shared logs, we write DC events to a dedicated
+    // direct-composition.log file in the app's logs directory. This file is
+    // automatically included when the user shares logs (LogManager shares all
+    // *.log / *.txt files in the logs dir).
+    //
+    // Call SurfaceCompositor.logEvent("message") from anywhere in the app to
+    // append a timestamped line. The file is opened lazily on first call and
+    // kept open for the session.
+
+    private static volatile File diagFile = null;
+    private static volatile FileWriter diagWriter = null;
+    private static final Object diagLock = new Object();
+    private static final SimpleDateFormat diagDateFormat =
+            new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+
+    /**
+     * Set the diagnostic file location. Called once from XServerDisplayActivity
+     * at session start (before any DC code runs). Pass the app's logs directory.
+     */
+    public static void initDiagnosticFile(File logsDir) {
+        synchronized (diagLock) {
+            try {
+                if (diagWriter != null) {
+                    diagWriter.flush();
+                    diagWriter.close();
+                }
+                if (logsDir != null && !logsDir.exists()) logsDir.mkdirs();
+                diagFile = new File(logsDir, "direct-composition.log");
+                diagWriter = new FileWriter(diagFile, /*append=*/false);
+                logEvent("=== Direct Composition diagnostic log started ===");
+                logEvent("Device: " + Build.MANUFACTURER + " " + Build.MODEL
+                        + " (API " + Build.VERSION.SDK_INT + ")");
+                logEvent("isAvailable() = " + isAvailable());
+            } catch (IOException e) {
+                Log.w(TAG, "Failed to init diagnostic file", e);
+                diagWriter = null;
+            }
+        }
+    }
+
+    /**
+     * Append a timestamped line to the diagnostic file. Also goes to logcat
+     * (Log.i) so it appears in logcat.log too. Safe to call from any thread.
+     */
+    public static void logEvent(String message) {
+        String timestamped = "[" + diagDateFormat.format(new Date()) + "] " + message;
+        Log.i(TAG, message);  // also to logcat
+        synchronized (diagLock) {
+            if (diagWriter != null) {
+                try {
+                    diagWriter.write(timestamped + "\n");
+                    diagWriter.flush();
+                } catch (IOException e) {
+                    // ignore — logcat still got it
+                }
+            }
+        }
+    }
+
+    /**
+     * Close the diagnostic file. Called from XServerDisplayActivity.onDestroy.
+     */
+    public static void closeDiagnosticFile() {
+        synchronized (diagLock) {
+            try {
+                if (diagWriter != null) {
+                    logEvent("=== Direct Composition diagnostic log closed ===");
+                    diagWriter.flush();
+                    diagWriter.close();
+                }
+            } catch (IOException ignored) {
+            } finally {
+                diagWriter = null;
+                diagFile = null;
+            }
+        }
+    }
 }
