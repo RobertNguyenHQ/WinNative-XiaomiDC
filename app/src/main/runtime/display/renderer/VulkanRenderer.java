@@ -74,6 +74,54 @@ public class VulkanRenderer
         this.swapRB = v;
         requestRenderCoalesced();
     }
+
+    // === DIRECT COMPOSITION (zero-copy AHB → SurfaceControl) ===
+    //
+    // When non-null and the current frame qualifies as a fullscreen
+    // direct-scanout candidate, the AHardwareBuffer backing that drawable is
+    // pushed to this layer in addition to the VulkanRenderer composition. The
+    // SC layer at z=1 covers the SurfaceView's primary layer at z=0, so HWC
+    // can promote it to a DPU overlay plane — zero GPU compositing cost, zero
+    // buffer copy. This is the true zero-copy path.
+    //
+    // Set/cleared by the activity from the UI thread via
+    // {@link #setDirectCompositionTarget}; read here on the render thread,
+    // hence volatile. The volatile only suppresses NEW frames from entering
+    // the SC push after the UI thread writes null — in-flight frames are
+    // protected by DirectCompositionLayer's own synchronized methods.
+    private volatile com.winlator.cmod.runtime.display.composition.DirectCompositionLayer
+            directCompositionTarget;
+
+    // Last (ahbPtr, dstW, dstH) pushed to directCompositionTarget. Per-frame
+    // pushBuffer calls allocate a SurfaceFlinger transaction, which is wasted
+    // work when nothing changed. DRI3 allocates a fresh GPUImage per Present
+    // cycle, so AHB-pointer identity is a sufficient "dirty" check.
+    // Render-thread-only — no synchronization needed.
+    private long dcLastPushedAhb = 0L;
+    private int dcLastPushedW = 0;
+    private int dcLastPushedH = 0;
+
+    // Consecutive pushBuffer == false returns. After enough failures the
+    // renderer detaches itself from the SC layer to avoid wasting JNI calls
+    // every frame on a permanent failure. Render-thread-only.
+    private int dcConsecutiveFailures = 0;
+    private static final int DC_FAIL_LIMIT = 8;
+
+    // True when the most recent frame successfully pushed an AHB to the SC,
+    // so the SC layer is currently visible. Used to detect transitions to
+    // the windowed/multi-drawable case so we can hide the SC cleanly.
+    private boolean dcLayerActive = false;
+
+    // Last skip reason logged for the DC candidate (diagnostic throttling —
+    // only log when the reason CHANGES, to avoid per-frame spam). Values:
+    //   "no-texture", "texture-not-gpuimage(Texture)", "gpuimage-ahb-null",
+    //   "ok". Empty string = nothing logged yet.
+    private String dcLastSkipReason = "";
+
+    // Last candidate-state logged (diagnostic throttling for the
+    // directCandidate null/present transition). Empty = nothing logged yet.
+    private String dcLastCandidateState = "";
+
     private boolean screenOffsetYRelativeToCursor = false;
     private String[] unviewableWMClasses = null;
     private float magnifierZoom = 1.0f;
@@ -341,6 +389,10 @@ public class VulkanRenderer
         int sourceW = 0;
         int sourceH = 0;
         int sourceArea = 0;
+        // Track the direct-scanout candidate Drawable (the largest window
+        // matching screen size) so we can push its AHB to the SurfaceControl
+        // after the VulkanRenderer composition. Render-thread-only.
+        Drawable directCandidate = null;
 
         try (XLock lock = xServer.lock(XServer.Lockable.WINDOW_MANAGER, XServer.Lockable.DRAWABLE_MANAGER)) {
             int screenW = xServer.screenInfo.width;
@@ -398,6 +450,8 @@ public class VulkanRenderer
                     sourceW = candidateW;
                     sourceH = candidateH;
                     sourceArea = candidateArea;
+                    // Track the Drawable for the Direct Composition push.
+                    directCandidate = drawable;
                 }
                 if (!loggedAhbSceneUse && tex instanceof GPUImage && ApplicationLogGate.isEnabled()) {
                     Log.i(TAG, "Submitting AHB-backed texture in Vulkan scene: windowCount="
@@ -498,6 +552,265 @@ public class VulkanRenderer
         nativeSetScene(nativeHandle, buf);
         // nativeSetFpsLimit is a native no-op (pacing is done elsewhere); not called per frame.
         nativeRenderFrame(nativeHandle);
+
+        // === DIRECT COMPOSITION per-frame hook ===
+        // After the VulkanRenderer composition, push the fullscreen candidate's
+        // AHardwareBuffer to the SurfaceControl layer (if attached and the
+        // candidate qualifies). The SC layer at z=1 covers the VulkanRenderer's
+        // output at z=0; HWC promotes it to a DPU overlay plane — zero GPU
+        // compositing cost, zero buffer copy. If no candidate qualifies, hide
+        // the SC layer (transition back to VulkanRenderer composition).
+        if (directCompositionTarget != null) {
+            // Throttled diagnostic: log when the candidate-null state changes,
+            // so we can see whether any window ever qualifies.
+            String candidateState = (directCandidate != null) ? "present" : "null";
+            if (!candidateState.equals(dcLastCandidateState)) {
+                dcLastCandidateState = candidateState;
+                if (directCandidate == null) {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC: no fullscreen direct-scanout candidate this frame "
+                                    + "(winCount=" + winCount + " sourceW=" + sourceW
+                                    + " sourceH=" + sourceH + " screenW="
+                                    + xServer.screenInfo.width + " screenH="
+                                    + xServer.screenInfo.height + ")");
+                } else {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC: fullscreen direct-scanout candidate detected "
+                                    + "(drawable=" + directCandidate.width + "x"
+                                    + directCandidate.height + " sourceW=" + sourceW
+                                    + " sourceH=" + sourceH + ")");
+                }
+            }
+            if (!maybePushDirectComposition(directCandidate)) {
+                maybeHideDirectComposition();
+            }
+        }
+    }
+
+    /**
+     * Direct Composition hot path: extract the AHardwareBuffer for the
+     * candidate's scanoutSource and hand it to the per-activity
+     * DirectCompositionLayer.
+     *
+     * <p>Holds {@code candidate.renderLock} for the lookup so we can't race
+     * against DRI3 replacing the texture or GPUImage.destroy() releasing the
+     * underlying AHB mid-read. The JNI pushBuffer runs INSIDE the lock too —
+     * short call, SurfaceFlinger takes its own ref on the AHB inside
+     * ASurfaceTransaction_setBuffer apply, so the buffer is safe to release
+     * on the X-server thread the moment we exit the lock.
+     *
+     * <p>Per-frame waste suppression: caches the last successfully-pushed
+     * (ahbPtr, dstW, dstH) and skips the JNI call when nothing has changed.
+     * DRI3 allocates a fresh GPUImage each Present, so AHB-pointer identity is
+     * a sufficient "buffer changed" signal.
+     *
+     * <p>Failure counter: after {@code DC_FAIL_LIMIT} consecutive false
+     * returns from pushBuffer, nulls directCompositionTarget so subsequent
+     * frames don't keep paying the JNI cost for a permanent failure.
+     *
+     * @return true if a fresh AHB was pushed OR the cache hit (SC is still
+     *         showing a valid prior frame). false = no qualifying candidate
+     *         (caller should hide the SC layer).
+     */
+    private boolean maybePushDirectComposition(Drawable directCandidate) {
+        final com.winlator.cmod.runtime.display.composition.DirectCompositionLayer dcTarget =
+                directCompositionTarget;
+        if (dcTarget == null) return false;
+        if (surfaceWidth <= 0 || surfaceHeight <= 0) return false;
+
+        // Force fallback to VulkanRenderer composition when an in-process
+        // overlay needs to be visible on top of the game frame. The SC layer
+        // at z=1 covers the VulkanRenderer's output at z=0, so anything we
+        // composite via VulkanRenderer (magnifier UI, debug HUDs, cursor)
+        // would otherwise be invisible.
+        if (magnifierUIActive) {
+            return false;
+        }
+        // No fullscreen candidate — fall back to VulkanRenderer.
+        if (directCandidate == null) {
+            // Log once when we first see no candidate (diagnostic — helps
+            // distinguish "no game window yet" from "game window exists but
+            // isn't AHB-backed"). Throttled by dcLayerActive to avoid spam.
+            return false;
+        }
+
+        final Drawable content = directCandidate;
+        synchronized (content.renderLock) {
+            Drawable scanoutSource = content.getScanoutSource();
+            if (scanoutSource == null) {
+                // No scanout source — the drawable itself is the source.
+                scanoutSource = content;
+            }
+            Texture tex = scanoutSource.getTexture();
+
+            // === DIAGNOSTIC: log why we might skip this candidate ===
+            // Throttle: only log when the situation CHANGES, to avoid per-frame
+            // spam. We use a simple "last logged state" tracker.
+            String currentState;
+            if (tex == null) {
+                currentState = "no-texture";
+            } else if (!(tex instanceof GPUImage)) {
+                currentState = "texture-not-gpuimage(" + tex.getClass().getSimpleName() + ")";
+            } else if (((GPUImage) tex).getHardwareBufferPtr() == 0L) {
+                currentState = "gpuimage-ahb-null";
+            } else {
+                currentState = "ok";
+            }
+            if (!currentState.equals(dcLastSkipReason)) {
+                dcLastSkipReason = currentState;
+                if (!currentState.equals("ok")) {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC skip: candidate " + currentState
+                                    + " (drawable=" + content.width + "x" + content.height
+                                    + " scanoutSource=" + (content.getScanoutSource() != null
+                                            ? (scanoutSource.width + "x" + scanoutSource.height)
+                                            : "self")
+                                    + " directScanout=" + content.isDirectScanout() + ")");
+                }
+            }
+
+            if (!(tex instanceof GPUImage)) return false;
+            long ahbPtr = ((GPUImage) tex).getHardwareBufferPtr();
+            if (ahbPtr == 0L) return false;
+
+            // Skip JNI when nothing has changed since the last push.
+            // SurfaceFlinger is still showing the layer; no point queueing a
+            // no-op transaction — this is the primary CPU/battery optimization.
+            if (ahbPtr == dcLastPushedAhb
+                    && surfaceWidth == dcLastPushedW
+                    && surfaceHeight == dcLastPushedH) {
+                return true;
+            }
+
+            // === VSYNC PACING ===
+            // Before pushing a NEW frame, wait for the PREVIOUS frame's
+            // ASurfaceTransaction to complete (the buffer is on display).
+            // This paces the render thread to SurfaceFlinger's vsync rate,
+            // eliminating the per-frame apply() storm that wastes CPU and
+            // battery. We hold the renderLock across the wait so the X-server
+            // worker thread can't swap the scanoutSource out from under us.
+            //
+            // Timeout: 20ms (~1 vsync at 60Hz, ~8ms at 120Hz). If SF is slow
+            // (e.g., heavy composition), we proceed anyway — a queued
+            // transaction is better than a frozen render thread.
+            //
+            // Only wait when we have a previously-pushed frame (dcLastPushedAhb
+            // != 0). The first frame has nothing to wait for.
+            if (dcLastPushedAhb != 0L) {
+                dcTarget.waitForPreviousFrame(20L);
+            }
+
+            // Producer-acquire fence: TAKE the FD from the scanout source
+            // under the renderLock, atomically clearing it. We are now the
+            // single owner; if pushBuffer succeeds, the framework closes the
+            // FD via setBuffer; if pushBuffer fails, the JNI layer closes the
+            // FD on its own error paths.
+            int fenceFd = scanoutSource.takeAcquireFenceFd();
+            boolean ok = dcTarget.pushBuffer(ahbPtr, 0, 0,
+                    surfaceWidth, surfaceHeight, fenceFd, /*opaque=*/true);
+            if (ok) {
+                dcLastPushedAhb = ahbPtr;
+                dcLastPushedW = surfaceWidth;
+                dcLastPushedH = surfaceHeight;
+                dcConsecutiveFailures = 0;
+                if (!dcLayerActive) {
+                    dcLayerActive = true;
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC ACTIVE — first frame pushed to SurfaceControl (ahb=0x"
+                                    + Long.toHexString(ahbPtr) + " " + surfaceWidth + "x" + surfaceHeight
+                                    + " drawable=" + content.width + "x" + content.height + ")");
+                    notifyDirectCompositionStateListener();
+                }
+                return true;
+            } else {
+                dcConsecutiveFailures++;
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DC pushBuffer FAILED (#" + dcConsecutiveFailures + ") — ahb=0x"
+                                + Long.toHexString(ahbPtr));
+                if (dcConsecutiveFailures >= DC_FAIL_LIMIT) {
+                    Log.w(TAG, "DirectComposition push failed " + dcConsecutiveFailures
+                            + " frames in a row — disabling target for this session");
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC DISABLED — " + DC_FAIL_LIMIT + " consecutive failures, self-detaching");
+                    // Hide the SC layer BEFORE nulling the field — once the
+                    // field is null, maybeHideDirectComposition has nothing to
+                    // call hide() on, and SurfaceFlinger would keep showing
+                    // the last successfully-pushed buffer over the
+                    // VulkanRenderer output forever.
+                    dcTarget.hide();
+                    if (dcLayerActive) {
+                        dcLayerActive = false;
+                        notifyDirectCompositionStateListener();
+                    }
+                    directCompositionTarget = null;
+                    dcLastPushedAhb = 0L;
+                    dcLastPushedW = 0;
+                    dcLastPushedH = 0;
+                    dcConsecutiveFailures = 0;
+                }
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Hide the Direct Composition layer when the current frame doesn't
+     * qualify for the SC fast path (windowed app, multi-drawable, cursor
+     * visible over a non-fullscreen scene, magnifier overlay, etc.).
+     * Idempotent and cheap after the first call: tracks dcLayerActive so we
+     * only queue a hide-transaction once per direct→fallback transition.
+     */
+    private void maybeHideDirectComposition() {
+        if (!dcLayerActive) return;
+        com.winlator.cmod.runtime.display.composition.DirectCompositionLayer dcTarget =
+                directCompositionTarget;
+        if (dcTarget != null) {
+            dcTarget.hide();
+        }
+        dcLayerActive = false;
+        notifyDirectCompositionStateListener();
+        // Invalidate the cache so the next pushBuffer re-shows with a fresh
+        // setBuffer + setVisibility(SHOW) transaction, even if the same AHB
+        // pointer happens to be active.
+        dcLastPushedAhb = 0L;
+        dcLastPushedW = 0;
+        dcLastPushedH = 0;
+    }
+
+    /**
+     * Hand the renderer the per-activity Direct Composition layer (or null to
+     * detach). Safe to call from the UI thread; the render thread reads the
+     * field volatile-ly each frame inside buildAndSubmitFrame().
+     */
+    public void setDirectCompositionTarget(
+            com.winlator.cmod.runtime.display.composition.DirectCompositionLayer layer) {
+        this.directCompositionTarget = layer;
+        // Invalidate cache so the first frame after attach pushes regardless.
+        dcLastPushedAhb = 0L;
+        dcLastPushedW = 0;
+        dcLastPushedH = 0;
+        dcConsecutiveFailures = 0;
+        dcLayerActive = false;
+        dcLastSkipReason = "";  // reset so next frame logs fresh skip reason
+        // Notify the listener that DC state may have changed (target attached
+        // or detached). The activity uses this to update the HUD indicator.
+        notifyDirectCompositionStateListener();
+    }
+
+    // === DC STATE LISTENER (for HUD indicator) ===
+    // Called when the DC layer goes active/inactive. The activity registers a
+    // listener to update the FrameRating HUD (" + DC" suffix on the renderer
+    // label). Null by default; set by XServerDisplayActivity.
+    public interface DirectCompositionStateListener {
+        void onDirectCompositionStateChanged(boolean active);
+    }
+    private volatile DirectCompositionStateListener dcStateListener;
+    public void setDirectCompositionStateListener(DirectCompositionStateListener listener) {
+        this.dcStateListener = listener;
+    }
+    private void notifyDirectCompositionStateListener() {
+        DirectCompositionStateListener l = dcStateListener;
+        if (l != null) l.onDirectCompositionStateChanged(dcLayerActive);
     }
 
     // ----- WindowManager / Pointer listeners --------------------------------

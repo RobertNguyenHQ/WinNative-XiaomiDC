@@ -26,6 +26,8 @@ import android.view.InputDevice;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.PointerIcon;
+import android.view.Surface;
+import android.view.SurfaceHolder;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
@@ -248,6 +250,14 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             "cmd"
     ));
     private XServerSurfaceView xServerView;
+
+    // === DIRECT COMPOSITION ===
+    // Per-activity DirectCompositionLayer wrapping a child ASurfaceControl.
+    // Non-null only when the container has Direct Composition enabled AND the
+    // device supports it (API 29+ + not blocklisted). Attached when the
+    // SurfaceView's surface is created, released on surface destroyed / activity destroy.
+    private com.winlator.cmod.runtime.display.composition.DirectCompositionLayer directCompositionLayer;
+    private boolean directCompositionInstalled = false;
     private InputControlsView inputControlsView;
     private boolean inputControlsRevealAllowed = false;
     private TouchpadView touchpadView;
@@ -353,6 +363,9 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     private static final long GRAPHICS_TEST_32_EXE_BYTES = 2333245L;
     private static final long GRAPHICS_TEST_64_EXE_BYTES = 2361407L;
     private String bootExePath;
+    private String bootExeArgs;
+    private boolean isDependencyInstall;
+    private volatile int dependencyExitStatus = 0;
 
     public boolean isPaused() { return isPaused; }
     public boolean isInputSuspended() {
@@ -1064,6 +1077,8 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         String shortcutUuid = getIntent().getStringExtra("shortcut_uuid");
         int shortcutPathHash = getIntent().getIntExtra("shortcut_path_hash", 0);
         bootExePath = getIntent().getStringExtra("boot_exe");
+        bootExeArgs = getIntent().getStringExtra("boot_exe_args");
+        isDependencyInstall = getIntent().getBooleanExtra("is_dependency_installer", false);
 
         android.net.Uri launchData = getIntent().getData();
         if (launchData != null) {
@@ -3673,6 +3688,17 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     @Override
     protected void onDestroy() {
         activityDestroyed.set(true);
+        // Release the Direct Composition layer BEFORE the rest of teardown —
+        // the native side waits for in-flight ASurfaceTransactions to complete
+        // before ASurfaceControl_release, which prevents the Xiaomi/HyperOS
+        // SurfaceFlinger crash that occurs if the SC is released while a
+        // transaction is still in-flight.
+        releaseDirectCompositionLayer();
+        // Close the DC diagnostic file so it's flushed and ready to share.
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.closeDiagnosticFile();
+        if (isDependencyInstall) {
+            com.winlator.cmod.runtime.content.component.DependencyInstallBridge.complete(dependencyExitStatus);
+        }
         unregisterDisplayChangeListener();
         unregisterControllerAutoHideListener();
         if (preloaderDialog != null) {
@@ -4978,10 +5004,10 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             sgsrUpscaleMode = clampSGSRUpscaleMode(preferences.getInt("sgsr_upscale_mode", 1));
             sgsrSharpness = preferences.getInt("sgsr_sharpness", legacyStrength);
         }
-        loadScreenEffectsFromContainer();
+        loadScreenEffects();
     }
 
-    private void loadScreenEffectsFromContainer() {
+    private void loadScreenEffects() {
         vividEnabled = false;
         vividStrength = 100;
         colorProfile = 0;
@@ -4999,8 +5025,13 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         pixelateEnabled = false;
         pixelateBlock = 6;
         colorBlind = 0;
-        if (container == null) return;
-        String json = container.getExtra("screenEffectsSettings");
+        String json = null;
+        if (shortcut != null) {
+            String fromShortcut = shortcut.getExtra("screenEffectsSettings", "");
+            if (!fromShortcut.isEmpty()) json = fromShortcut;
+        } else if (preferences != null) {
+            json = preferences.getString("screenEffectsSettings", null);
+        }
         if (json == null || json.isEmpty()) return;
         try {
             JSONObject o = new JSONObject(json);
@@ -5027,7 +5058,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
     }
 
     private void saveScreenEffectsSettings() {
-        if (container == null) return;
+        if (shortcut == null && preferences == null) return;
         try {
             JSONObject o = new JSONObject();
             o.put("vividEnabled", vividEnabled);
@@ -5047,8 +5078,13 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             o.put("pixelateEnabled", pixelateEnabled);
             o.put("pixelateBlock", pixelateBlock);
             o.put("colorBlind", colorBlind);
-            container.putExtra("screenEffectsSettings", o.toString());
-            container.saveData();
+            String json = o.toString();
+            if (shortcut != null) {
+                shortcut.putExtra("screenEffectsSettings", json);
+                shortcut.saveData();
+            } else if (preferences != null) {
+                preferences.edit().putString("screenEffectsSettings", json).apply();
+            }
         } catch (JSONException e) {
             Log.e("XServerDisplayActivity", "Failed to save screen effects", e);
         }
@@ -6341,6 +6377,15 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             Log.d("XServerDisplayActivity", "Guest process terminated with status: " + status);
             stopWnLauncherStatusTailer();
 
+            if (isDependencyInstall) {
+                // Signal completion only after the single-instance session window is fully torn down
+                // (in onDestroy). The teardown in exit() takes several seconds; releasing the installer
+                // here would let the next queued install launch into this still-alive activity.
+                dependencyExitStatus = status;
+                exit();
+                return;
+            }
+
 
             boolean planWActiveTerm = com.winlator.cmod.feature.stores.steam.utils
                     .PrefManager.INSTANCE.getWnPlanW();
@@ -6445,6 +6490,26 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
         xServer.setRenderer(renderer);
         rootView.addView(xServerView);
 
+        // === DIRECT COMPOSITION lifecycle install ===
+        // If the container has Direct Composition enabled AND the device
+        // supports ASurfaceControl (API 29+ + not blocklisted), install the
+        // SurfaceHolder callback that attaches/releases the
+        // DirectCompositionLayer around the SurfaceView's surface lifecycle.
+        installDirectCompositionLifecycle();
+
+        // === HUD INDICATOR for Direct Composition ===
+        // Register a listener on the VulkanRenderer so that when DC goes
+        // active/inactive, the FrameRating HUD updates its renderer label
+        // (appends " + DC" in green when active). The frameRating may not
+        // exist yet (created later if FPS monitor is enabled); the listener
+        // null-checks it on each callback.
+        renderer.setDirectCompositionStateListener(active -> {
+            final FrameRating fr = frameRating;
+            if (fr != null) {
+                runOnUiThread(() -> fr.setDirectCompositionActive(active));
+            }
+        });
+
         globalCursorSpeed = preferences.getFloat("cursor_speed", 1.0f);
         touchpadView = new TouchpadView(this, xServer, timeoutHandler, hideControlsRunnable);
         touchpadView.setTapToClickEnabled(isTapToClickEnabled);
@@ -6535,6 +6600,155 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             }
         }
         return shortcutName;
+    }
+
+    // === DIRECT COMPOSITION LIFECYCLE ===
+    //
+    // Installs a SurfaceHolder.Callback on xServerView's holder that:
+    //   - On surfaceCreated: creates the DirectCompositionLayer, attaches it
+    //     to the Surface, and hands it to the VulkanRenderer as its
+    //     directCompositionTarget.
+    //   - On surfaceDestroyed: detaches the target from the renderer, releases
+    //     the layer.
+    // The layer is only created if:
+    //   1. The container has Direct Composition enabled.
+    //   2. SurfaceCompositor.isAvailable() (API 29+ + symbols present + not
+    //      blocklisted).
+    // Otherwise this is a no-op — VulkanRenderer composites normally.
+    private void installDirectCompositionLifecycle() {
+        if (directCompositionInstalled) return;
+        if (xServerView == null) return;
+
+        // Init the diagnostic file so DC events are captured in the user's
+        // shared logs (the wine_*.txt logs only capture Wine stderr, not
+        // logcat). The file lives in the app's logs dir and is auto-included
+        // when the user shares logs.
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.initDiagnosticFile(
+                com.winlator.cmod.runtime.system.LogManager.getLogsDir(this));
+
+        // Read the toggle: shortcut overrides container (matches the swapRB
+        // pattern at line ~6470). If no shortcut, fall back to the container.
+        boolean enabled;
+        if (shortcut != null) {
+            enabled = shortcut.getExtra(
+                    com.winlator.cmod.runtime.container.Container.EXTRA_DIRECT_COMPOSITION,
+                    container != null && container.isDirectCompositionEnabled() ? "1" : "0")
+                    .equals("1");
+        } else {
+            enabled = container != null && container.isDirectCompositionEnabled();
+        }
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "installDirectCompositionLifecycle: enabled=" + enabled
+                        + " hasShortcut=" + (shortcut != null)
+                        + " hasContainer=" + (container != null));
+        if (!enabled) {
+            com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                    "Direct Composition DISABLED for this session (toggle off)");
+            Log.i("XServerDisplayActivity", "Direct Composition disabled for this session");
+            return;
+        }
+        boolean available = com.winlator.cmod.runtime.display.composition.SurfaceCompositor.isAvailable();
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "SurfaceCompositor.isAvailable() = " + available);
+        if (!available) {
+            com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                    "Direct Composition NOT available — API < 29, missing symbols, or blocklisted. "
+                            + "Falling back to VulkanRenderer composition.");
+            Log.w("XServerDisplayActivity",
+                    "Direct Composition enabled but not available on this device "
+                            + "(API < 29, missing symbols, or blocklisted). "
+                            + "Falling back to VulkanRenderer composition.");
+            return;
+        }
+
+        directCompositionInstalled = true;
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "Installing Direct Composition lifecycle — attaching SurfaceHolder callback");
+        Log.i("XServerDisplayActivity", "Installing Direct Composition lifecycle");
+
+        xServerView.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                // GLSurfaceView's render thread can fire surfaceCreated before
+                // setupUI returns, so the initial surfaceCreated may have
+                // already happened by the time we install this callback. The
+                // XServerSurfaceView handles the initial attach internally;
+                // we just need to attach our SC layer here.
+                if (directCompositionLayer != null) return;
+                android.view.Surface surface = holder.getSurface();
+                if (surface == null || !surface.isValid()) return;
+
+                directCompositionLayer = new com.winlator.cmod.runtime.display.composition.DirectCompositionLayer();
+                if (!directCompositionLayer.attach(surface)) {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DirectCompositionLayer.attach FAILED — disabling DC for this session");
+                    Log.e("XServerDisplayActivity",
+                            "DirectCompositionLayer.attach failed — disabling DC for this session");
+                    directCompositionLayer.release();
+                    directCompositionLayer = null;
+                    return;
+                }
+                VulkanRenderer r = xServerView != null ? xServerView.getRenderer() : null;
+                if (r != null) {
+                    r.setDirectCompositionTarget(directCompositionLayer);
+                }
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DirectCompositionLayer ATTACHED — SC layer created, waiting for first frame");
+                Log.i("XServerDisplayActivity", "Direct Composition layer attached");
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+                // No-op — the SC layer's geometry is set per-frame in
+                // VulkanRenderer.maybePushDirectComposition via setPosition/setScale.
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                releaseDirectCompositionLayer();
+            }
+        });
+
+        // If the surface was already created before we installed the callback
+        // (race with GLSurfaceView's GLThread), synthesize the initial attach.
+        if (xServerView.getHolder().getSurface() != null
+                && xServerView.getHolder().getSurface().isValid()) {
+            android.view.Surface surface = xServerView.getHolder().getSurface();
+            directCompositionLayer = new com.winlator.cmod.runtime.display.composition.DirectCompositionLayer();
+            if (directCompositionLayer.attach(surface)) {
+                VulkanRenderer r = xServerView.getRenderer();
+                if (r != null) r.setDirectCompositionTarget(directCompositionLayer);
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DirectCompositionLayer ATTACHED (synthesized initial) — waiting for first frame");
+                Log.i("XServerDisplayActivity",
+                        "Direct Composition layer attached (synthesized initial)");
+            } else {
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        "DirectCompositionLayer.attach FAILED (synthesized) — disabling DC");
+                directCompositionLayer.release();
+                directCompositionLayer = null;
+            }
+        }
+    }
+
+    /**
+     * Detach the DirectCompositionLayer from the renderer and release it.
+     * Safe to call from the UI thread; DirectCompositionLayer's synchronized
+     * methods serialize against any in-flight pushBuffer on the render thread.
+     * The native side waits for in-flight ASurfaceTransactions to complete
+     * before ASurfaceControl_release (prevents the Xiaomi/HyperOS SF crash).
+     */
+    private void releaseDirectCompositionLayer() {
+        if (directCompositionLayer == null) return;
+        com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                "releaseDirectCompositionLayer: detaching + releasing SC layer");
+        VulkanRenderer r = xServerView != null ? xServerView.getRenderer() : null;
+        if (r != null) {
+            r.setDirectCompositionTarget(null);
+        }
+        directCompositionLayer.release();
+        directCompositionLayer = null;
+        Log.i("XServerDisplayActivity", "Direct Composition layer released");
     }
 
     private void setTextColorForDialog(ViewGroup viewGroup, int color) {
@@ -6965,6 +7179,17 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
             }
         }
 
+        boolean wantLeegao = "wrapper-leegao".equals(graphicsDriver);
+        File leegaoMarker = new File(rootDir, "usr/lib/.wrapper_leegao");
+        if (wantLeegao) {
+            TarCompressorUtils.extract(TarCompressorUtils.Type.ZSTD, this, "graphics_driver/wrapper-leegao.tzst", rootDir);
+            try { leegaoMarker.createNewFile(); } catch (IOException ignored) {}
+        } else if (leegaoMarker.exists()) {
+            TarCompressorUtils.extract(TarCompressorUtils.Type.ZSTD, this, "graphics_driver/wrapper" + ".tzst", rootDir);
+            TarCompressorUtils.extract(TarCompressorUtils.Type.ZSTD, this, "layers" + ".tzst", rootDir);
+            leegaoMarker.delete();
+        }
+
         if (adrenoToolsDriverId != null && !adrenoToolsDriverId.isEmpty()
                 && !adrenoToolsDriverId.equals("System")) {
             AdrenotoolsManager adrenotoolsManager = new AdrenotoolsManager(this);
@@ -6975,6 +7200,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
                     adrenoToolsDriverId + "' name='" + driverDisplayName +
                     "' version='" + driverVersion + "' library='" + driverLibrary + "'");
             adrenotoolsManager.setDriverById(envVars, imageFs, adrenoToolsDriverId);
+            if (wantLeegao) envVars.put("ADRENOTOOLS_HOOKS_PATH", imageFs.getLibDir().getPath());
             Log.i("GraphicsDriverExtraction", "Loaded graphics/Turnip driver env: id='" +
                     adrenoToolsDriverId + "' path=" +
                     envVars.get("ADRENOTOOLS_DRIVER_PATH") + " name=" +
@@ -7046,14 +7272,14 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
 
         switch (bcnEmulation) {
             case "auto" -> {
-                if ("compute".equals(bcnEmulationType)) {
+                if ("compute".equals(bcnEmulationType) && GPUInformation.getVendorID(null, null) != 20803) {
                     envVars.put("ENABLE_BCN_COMPUTE", "1");
                     envVars.put("BCN_COMPUTE_AUTO", "1");
                 }
                 envVars.put("WRAPPER_EMULATE_BCN", "3");
             }
             case "full" -> {
-                if ("compute".equals(bcnEmulationType)) {
+                if ("compute".equals(bcnEmulationType) && GPUInformation.getVendorID(null, null) != 20803) {
                     envVars.put("ENABLE_BCN_COMPUTE", "1");
                     envVars.put("BCN_COMPUTE_AUTO", "0");
                 }
@@ -7470,6 +7696,7 @@ public class XServerDisplayActivity extends FixedFontScaleAppCompatActivity {
 
         if (bootExePath != null && !bootExePath.isEmpty()) {
             args = "\"" + bootExePath + "\"";
+            if (bootExeArgs != null && !bootExeArgs.isEmpty()) args += " " + bootExeArgs;
         } else if (shortcut != null) {
             String path = shortcut.path;
             String gameSource = shortcut.getExtra("game_source", "CUSTOM");

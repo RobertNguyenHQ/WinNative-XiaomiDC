@@ -404,6 +404,14 @@ class ShortcutSettingsComposeDialog private constructor(
         )
         state.fullscreenStretched.value = fullscreenStretched == "1"
 
+        // Direct Composition (per-shortcut override of the container setting).
+        // Falls back to the container's value when the shortcut doesn't override.
+        val directComposition = getShortcutSetting(
+            Container.EXTRA_DIRECT_COMPOSITION,
+            if (container.isDirectCompositionEnabled()) "1" else "0"
+        )
+        state.directComposition.value = directComposition == "1"
+
         // LC_ALL
         state.lcAll.value = getShortcutSetting("lc_all", container.getLC_ALL())
 
@@ -1058,6 +1066,13 @@ class ShortcutSettingsComposeDialog private constructor(
                 "fullscreenStretched",
                 if (state.fullscreenStretched.value) "1" else "0",
                 if (container.isFullscreenStretched) "1" else "0"
+            )
+
+            // Direct Composition (per-shortcut override)
+            hasContainerOverride = hasContainerOverride or saveOverride(
+                Container.EXTRA_DIRECT_COMPOSITION,
+                if (state.directComposition.value) "1" else "0",
+                if (container.isDirectCompositionEnabled()) "1" else "0"
             )
 
             // Win components
@@ -2149,6 +2164,7 @@ class ShortcutSettingsComposeDialog private constructor(
 
         state.lcAll.value = container.getLC_ALL()
         state.fullscreenStretched.value = container.isFullscreenStretched
+        state.directComposition.value = container.isDirectCompositionEnabled()
 
         val startupEntries = state.startupSelectionEntries.value
         state.selectedStartupSelection.intValue = container.getStartupSelection().toInt()

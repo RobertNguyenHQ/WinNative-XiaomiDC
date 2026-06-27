@@ -102,14 +102,15 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.draw.scale
 import com.winlator.cmod.R
+import com.winlator.cmod.runtime.wine.WineThemeManager
 import com.winlator.cmod.shared.ui.outlinedSwitchColors
 import com.winlator.cmod.shared.ui.widget.EnvVarsView
 import com.winlator.cmod.shared.ui.widget.chasingBorder
 import kotlin.math.roundToInt
 
-private val BgDeep = Color(0xFF18181D)
-private val SidebarBg = Color(0xFF18181D)
-private val ContentBg = Color(0xFF18181D)
+private val BgDeep = Color(0xFF11111C)
+private val SidebarBg = Color(0xFF11111C)
+private val ContentBg = Color(0xFF11111C)
 private val CardSurface = Color(0xFF1C1C2A)
 private val CardBorder = Color(0xFF2A2A3A)
 private val InputSurface = Color(0xFF171722)
@@ -376,6 +377,9 @@ class GameSettingsStateHolder {
     val selectedStartupSelection = mutableIntStateOf(0)
     val execArgs = mutableStateOf("")
     val fullscreenStretched = mutableStateOf(false)
+    // Direct Composition (zero-copy AHB → SurfaceControl + HWC overlay).
+    // Per-container toggle; read once at activity startup. See Container.EXTRA_DIRECT_COMPOSITION.
+    val directComposition = mutableStateOf(false)
 
     // Advanced - CPU
     val cpuCount = mutableIntStateOf(Runtime.getRuntime().availableProcessors())
@@ -2082,11 +2086,10 @@ private fun WineSection(
                     onSelected = { state.selectedDesktopBackgroundType.intValue = it }
                 )
 
-                val typeEntries = state.desktopBackgroundTypeEntries.value
-                val selectedType = typeEntries.getOrNull(state.selectedDesktopBackgroundType.intValue)
-                    ?.lowercase() ?: ""
-                when (selectedType) {
-                    "color" -> {
+                val bgType = WineThemeManager.BackgroundType.values()
+                    .getOrNull(state.selectedDesktopBackgroundType.intValue)
+                when (bgType) {
+                    WineThemeManager.BackgroundType.COLOR -> {
                         Spacer(Modifier.height(SettingItemGap))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -2114,7 +2117,7 @@ private fun WineSection(
                             )
                         }
                     }
-                    "image" -> {
+                    WineThemeManager.BackgroundType.IMAGE -> {
                         Spacer(Modifier.height(SettingItemGap))
                         Row(
                             modifier = Modifier
@@ -2146,6 +2149,7 @@ private fun WineSection(
                             }
                         }
                     }
+                    else -> {}
                 }
             }
         }
@@ -3366,6 +3370,14 @@ private fun AdvancedSection(
             label = stringResource(R.string.session_display_fullscreen_stretched),
             checked = state.fullscreenStretched.value,
             onCheckedChange = { state.fullscreenStretched.value = it }
+        )
+
+        Spacer(Modifier.height(SettingItemGap))
+
+        SettingCheckbox(
+            label = stringResource(R.string.session_display_direct_composition),
+            checked = state.directComposition.value,
+            onCheckedChange = { state.directComposition.value = it }
         )
     }
 
