@@ -682,6 +682,24 @@ public class VulkanRenderer
                 return true;
             }
 
+            // === VSYNC PACING ===
+            // Before pushing a NEW frame, wait for the PREVIOUS frame's
+            // ASurfaceTransaction to complete (the buffer is on display).
+            // This paces the render thread to SurfaceFlinger's vsync rate,
+            // eliminating the per-frame apply() storm that wastes CPU and
+            // battery. We hold the renderLock across the wait so the X-server
+            // worker thread can't swap the scanoutSource out from under us.
+            //
+            // Timeout: 20ms (~1 vsync at 60Hz, ~8ms at 120Hz). If SF is slow
+            // (e.g., heavy composition), we proceed anyway — a queued
+            // transaction is better than a frozen render thread.
+            //
+            // Only wait when we have a previously-pushed frame (dcLastPushedAhb
+            // != 0). The first frame has nothing to wait for.
+            if (dcLastPushedAhb != 0L) {
+                dcTarget.waitForPreviousFrame(20L);
+            }
+
             // Producer-acquire fence: TAKE the FD from the scanout source
             // under the renderLock, atomically clearing it. We are now the
             // single owner; if pushBuffer succeeds, the framework closes the

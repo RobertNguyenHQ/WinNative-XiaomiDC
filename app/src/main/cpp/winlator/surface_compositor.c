@@ -124,6 +124,25 @@ typedef void (*pfn_ASurfaceTransaction_setExtendedRangeBrightness)(struct ASurfa
                                                                    float currentBufferRatio,
                                                                    float desiredRatio);
 
+// === VSYNC PACING (setOnComplete / setOnCommit) ===
+// The callback types for frame-completion notifications. setOnComplete fires
+// when the buffer is "observable on display" (post-vsync); setOnCommit fires
+// earlier (when SF applies the transaction, ~1 vsync before OnComplete).
+// We use setOnComplete to pace the render thread — it tells us the previous
+// frame is done and we can safely start the next one without queuing a
+// backlog of transactions in SF.
+typedef struct ASurfaceTransactionStats ASurfaceTransactionStats;
+typedef void (*ASurfaceTransaction_OnComplete)(void* context,
+                                               ASurfaceTransactionStats* stats);
+typedef void (*ASurfaceTransaction_OnCommit)(void* context,
+                                             ASurfaceTransactionStats* stats);
+typedef void (*pfn_ASurfaceTransaction_setOnComplete)(struct ASurfaceTransaction* t,
+                                                      void* context,
+                                                      ASurfaceTransaction_OnComplete func);
+typedef void (*pfn_ASurfaceTransaction_setOnCommit)(struct ASurfaceTransaction* t,
+                                                    void* context,
+                                                    ASurfaceTransaction_OnCommit func);
+
 // One-shot init under mutex. After init completes, all g_* function pointers
 // are effectively const for the rest of the process and can be read without
 // further locking.
@@ -150,15 +169,26 @@ static pfn_ASurfaceTransaction_setBufferTransform g_tx_set_buffer_transform = NU
 static pfn_ASurfaceTransaction_setBufferDataSpace g_tx_set_buffer_dataspace = NULL;
 static pfn_ASurfaceTransaction_setBufferTransparency g_tx_set_buffer_transparency = NULL;
 static pfn_ASurfaceTransaction_setExtendedRangeBrightness g_tx_set_extended_range_brightness = NULL;
+static pfn_ASurfaceTransaction_setOnComplete g_tx_set_on_complete = NULL;
+static pfn_ASurfaceTransaction_setOnCommit  g_tx_set_on_commit  = NULL;
 
 // === IN-FLIGHT TRANSACTION TRACKING ===
 // Tracks whether an ASurfaceTransaction_apply is still being processed by
 // SurfaceFlinger. release() waits for this to clear before calling
 // ASurfaceControl_release, to avoid the Xiaomi/HyperOS crash where releasing
 // a SurfaceControl while a transaction is in-flight kills SurfaceFlinger.
+//
+// The OnComplete callback (set via ASurfaceTransaction_setOnComplete) calls
+// inflight_decrement when SF finishes processing the transaction. This means
+// inflight_count reflects the ACTUAL SF processing state, not just "we called
+// apply()". This is what makes vsync pacing work — the render thread can wait
+// on g_inflight_cv to block until the previous frame is truly done.
 static pthread_mutex_t g_inflight_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_inflight_cv    = PTHREAD_COND_INITIALIZER;
 static int g_inflight_count = 0;
+// True if setOnComplete is available (API 29+). When false, we fall back to
+// fire-and-forget apply (no pacing) — the render thread doesn't wait.
+static bool g_has_on_complete = false;
 
 static void inflight_increment(void) {
     pthread_mutex_lock(&g_inflight_mutex);
@@ -233,6 +263,13 @@ static void init_once_locked(void) {
     RESOLVE(g_tx_set_buffer_dataspace,         "ASurfaceTransaction_setBufferDataSpace");
     RESOLVE(g_tx_set_buffer_transparency,      "ASurfaceTransaction_setBufferTransparency");
     RESOLVE(g_tx_set_extended_range_brightness, "ASurfaceTransaction_setExtendedRangeBrightness");
+    // Optional vsync-pacing symbols (API 29+ for OnComplete, API 31+ for OnCommit).
+    // We use OnComplete to pace the render thread — it fires when the previous
+    // frame is "observable on display", so we can safely start the next frame
+    // without queuing a backlog of transactions in SurfaceFlinger.
+    RESOLVE(g_tx_set_on_complete, "ASurfaceTransaction_setOnComplete");
+    RESOLVE(g_tx_set_on_commit,   "ASurfaceTransaction_setOnCommit");
+    g_has_on_complete = (g_tx_set_on_complete != NULL);
 
     // Availability gate: the Phase-1 lifecycle symbols + setBuffer + at least
     // one COMPLETE geometry API (either the deprecated setGeometry, or all
@@ -248,12 +285,14 @@ static void init_once_locked(void) {
 
     if (g_available) {
         LOGI("Direct Composition available. Geometry path: %s, colour symbols: "
-             "setBufferDataSpace=%s setBufferTransparency=%s setExtendedRangeBrightness=%s",
+             "setBufferDataSpace=%s setBufferTransparency=%s setExtendedRangeBrightness=%s, "
+             "vsync pacing: setOnComplete=%s",
              has_complete_geometry_31 ? "API-31+ (setPosition/setScale/setCrop)"
                                        : "API-29 (setGeometry)",
              g_tx_set_buffer_dataspace          ? "yes" : "MISSING",
              g_tx_set_buffer_transparency       ? "yes" : "MISSING",
-             g_tx_set_extended_range_brightness ? "yes (API 34+)" : "MISSING (API < 34)");
+             g_tx_set_extended_range_brightness ? "yes (API 34+)" : "MISSING (API < 34)",
+             g_has_on_complete ? "yes (render thread will be paced to vsync)" : "MISSING (fire-and-forget)");
     } else {
         LOGW("Direct Composition NOT available — missing required symbols");
     }
@@ -275,6 +314,64 @@ Java_com_winlator_cmod_runtime_display_composition_SurfaceCompositor_nativeIsAva
     (void)env;
     (void)clazz;
     return ensure_initialised() ? JNI_TRUE : JNI_FALSE;
+}
+
+// === OnComplete callback (vsync pacing) ===
+// Called by SurfaceFlinger on its own thread when the transaction is complete
+// (the buffer is "observable on display"). We decrement the in-flight count
+// so the render thread's nativeWaitForPreviousFrame() can return.
+//
+// IMPORTANT: this runs on the SF binder thread, NOT the render thread. We
+// must not touch any render-thread state here — just the inflight mutex+cv.
+static void on_transaction_complete(void* context, ASurfaceTransactionStats* stats) {
+    (void)context;
+    (void)stats;
+    inflight_decrement();
+}
+
+// ---------------------------------------------------------------------------
+// JNI: nativeWaitForPreviousFrame(timeout_ms) -> jboolean
+//
+// Blocks the render thread until the previously-applied ASurfaceTransaction
+// is complete (the buffer is on display). Returns true if it completed within
+// the timeout, false on timeout.
+//
+// This is the vsync-pacing mechanism: the render thread calls this BEFORE
+// pushing the next frame, so we never queue more than one transaction ahead
+// of SurfaceFlinger. This eliminates the per-frame apply() storm and paces
+// the render thread to the display's vsync rate.
+//
+// If setOnComplete is not available (API < 29 — but we already gate on that),
+// this is a no-op (returns true immediately).
+// ---------------------------------------------------------------------------
+JNIEXPORT jboolean JNICALL
+Java_com_winlator_cmod_runtime_display_composition_DirectCompositionLayer_nativeWaitForPreviousFrame(
+    JNIEnv* env, jobject thiz, jlong timeout_ms) {
+    (void)env;
+    (void)thiz;
+    if (!g_has_on_complete) return JNI_TRUE;  // no pacing possible
+    if (g_inflight_count == 0) return JNI_TRUE;  // nothing in flight
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    int64_t add_ns = (int64_t)timeout_ms * 1000000L;
+    deadline.tv_sec += (time_t)(add_ns / 1000000000L);
+    deadline.tv_nsec += (long)(add_ns % 1000000000L);
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_nsec -= 1000000000L;
+        deadline.tv_sec += 1;
+    }
+
+    pthread_mutex_lock(&g_inflight_mutex);
+    bool ok = true;
+    while (g_inflight_count > 0) {
+        if (pthread_cond_timedwait(&g_inflight_cv, &g_inflight_mutex, &deadline) == ETIMEDOUT) {
+            ok = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_inflight_mutex);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 // ---------------------------------------------------------------------------
@@ -494,9 +591,26 @@ Java_com_winlator_cmod_runtime_display_composition_DirectCompositionLayer_native
     // Show the layer (atomic with setBuffer — avoids blank-frame race).
     g_tx_set_visibility(tx, sc, DC_VISIBILITY_SHOW);
 
+    // === VSYNC PACING ===
+    // When setOnComplete is available (API 29+), register the completion
+    // callback BEFORE apply. The callback fires on SF's thread when the
+    // buffer is on display, and calls inflight_decrement(). We do NOT
+    // decrement synchronously after apply — we leave the count elevated
+    // so nativeWaitForPreviousFrame() can block the next frame until SF
+    // is truly done.
+    //
+    // When setOnComplete is NOT available (shouldn't happen on API 29+,
+    // but defensive), fall back to fire-and-forget: decrement synchronously
+    // after apply (no pacing, but no deadlock either).
     inflight_increment();
-    g_tx_apply(tx);
-    inflight_decrement();
+    if (g_has_on_complete) {
+        g_tx_set_on_complete(tx, NULL, on_transaction_complete);
+        g_tx_apply(tx);
+        // Do NOT decrement here — the callback will do it when SF completes.
+    } else {
+        g_tx_apply(tx);
+        inflight_decrement();
+    }
     g_tx_delete(tx);
 
     return JNI_TRUE;
