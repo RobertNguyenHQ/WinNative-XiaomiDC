@@ -112,6 +112,16 @@ public class VulkanRenderer
     // the windowed/multi-drawable case so we can hide the SC cleanly.
     private boolean dcLayerActive = false;
 
+    // Last skip reason logged for the DC candidate (diagnostic throttling —
+    // only log when the reason CHANGES, to avoid per-frame spam). Values:
+    //   "no-texture", "texture-not-gpuimage(Texture)", "gpuimage-ahb-null",
+    //   "ok". Empty string = nothing logged yet.
+    private String dcLastSkipReason = "";
+
+    // Last candidate-state logged (diagnostic throttling for the
+    // directCandidate null/present transition). Empty = nothing logged yet.
+    private String dcLastCandidateState = "";
+
     private boolean screenOffsetYRelativeToCursor = false;
     private String[] unviewableWMClasses = null;
     private float magnifierZoom = 1.0f;
@@ -551,6 +561,26 @@ public class VulkanRenderer
         // compositing cost, zero buffer copy. If no candidate qualifies, hide
         // the SC layer (transition back to VulkanRenderer composition).
         if (directCompositionTarget != null) {
+            // Throttled diagnostic: log when the candidate-null state changes,
+            // so we can see whether any window ever qualifies.
+            String candidateState = (directCandidate != null) ? "present" : "null";
+            if (!candidateState.equals(dcLastCandidateState)) {
+                dcLastCandidateState = candidateState;
+                if (directCandidate == null) {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC: no fullscreen direct-scanout candidate this frame "
+                                    + "(winCount=" + winCount + " sourceW=" + sourceW
+                                    + " sourceH=" + sourceH + " screenW="
+                                    + xServer.screenInfo.width + " screenH="
+                                    + xServer.screenInfo.height + ")");
+                } else {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC: fullscreen direct-scanout candidate detected "
+                                    + "(drawable=" + directCandidate.width + "x"
+                                    + directCandidate.height + " sourceW=" + sourceW
+                                    + " sourceH=" + sourceH + ")");
+                }
+            }
             if (!maybePushDirectComposition(directCandidate)) {
                 maybeHideDirectComposition();
             }
@@ -596,12 +626,11 @@ public class VulkanRenderer
         if (magnifierUIActive) {
             return false;
         }
-        // Only fullscreen direct-scanout candidates qualify. If the candidate
-        // doesn't match the screen dimensions, fall back to VulkanRenderer.
-        if (directCandidate == null) return false;
-        if (!directCandidate.isDirectScanout()) {
-            // directScanout is set by the X server when a window is promoted
-            // to fullscreen scanout. If not set, this isn't a scanout candidate.
+        // No fullscreen candidate — fall back to VulkanRenderer.
+        if (directCandidate == null) {
+            // Log once when we first see no candidate (diagnostic — helps
+            // distinguish "no game window yet" from "game window exists but
+            // isn't AHB-backed"). Throttled by dcLayerActive to avoid spam.
             return false;
         }
 
@@ -613,6 +642,33 @@ public class VulkanRenderer
                 scanoutSource = content;
             }
             Texture tex = scanoutSource.getTexture();
+
+            // === DIAGNOSTIC: log why we might skip this candidate ===
+            // Throttle: only log when the situation CHANGES, to avoid per-frame
+            // spam. We use a simple "last logged state" tracker.
+            String currentState;
+            if (tex == null) {
+                currentState = "no-texture";
+            } else if (!(tex instanceof GPUImage)) {
+                currentState = "texture-not-gpuimage(" + tex.getClass().getSimpleName() + ")";
+            } else if (((GPUImage) tex).getHardwareBufferPtr() == 0L) {
+                currentState = "gpuimage-ahb-null";
+            } else {
+                currentState = "ok";
+            }
+            if (!currentState.equals(dcLastSkipReason)) {
+                dcLastSkipReason = currentState;
+                if (!currentState.equals("ok")) {
+                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                            "DC skip: candidate " + currentState
+                                    + " (drawable=" + content.width + "x" + content.height
+                                    + " scanoutSource=" + (content.getScanoutSource() != null
+                                            ? (scanoutSource.width + "x" + scanoutSource.height)
+                                            : "self")
+                                    + " directScanout=" + content.isDirectScanout() + ")");
+                }
+            }
+
             if (!(tex instanceof GPUImage)) return false;
             long ahbPtr = ((GPUImage) tex).getHardwareBufferPtr();
             if (ahbPtr == 0L) return false;
@@ -643,7 +699,8 @@ public class VulkanRenderer
                     dcLayerActive = true;
                     com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
                             "DC ACTIVE — first frame pushed to SurfaceControl (ahb=0x"
-                                    + Long.toHexString(ahbPtr) + " " + surfaceWidth + "x" + surfaceHeight + ")");
+                                    + Long.toHexString(ahbPtr) + " " + surfaceWidth + "x" + surfaceHeight
+                                    + " drawable=" + content.width + "x" + content.height + ")");
                     notifyDirectCompositionStateListener();
                 }
                 return true;
@@ -716,6 +773,7 @@ public class VulkanRenderer
         dcLastPushedH = 0;
         dcConsecutiveFailures = 0;
         dcLayerActive = false;
+        dcLastSkipReason = "";  // reset so next frame logs fresh skip reason
         // Notify the listener that DC state may have changed (target attached
         // or detached). The activity uses this to update the HUD indicator.
         notifyDirectCompositionStateListener();
