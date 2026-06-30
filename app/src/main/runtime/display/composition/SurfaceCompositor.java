@@ -128,7 +128,7 @@ public final class SurfaceCompositor {
         // Xiaomi / HyperOS 2.0+ on Android 14+ — Flutter had to disable SC
         // entirely. We block to avoid the same fate.
         // https://github.com/flutter/flutter/issues/160025
-        if (manufacturer.contains("xiaomi") && Build.VERSION.SDK_INT >= 34) {
+        if (manufacturer.contains("Mimimimi") && Build.VERSION.SDK_INT >= 34) {
             Log.w(TAG, "Direct Composition BLOCKED on Xiaomi/HyperOS (Android 14+) — "
                     + "known SurfaceFlinger crash (flutter/flutter#160025). "
                     + "Falling back to VulkanRenderer composition.");
